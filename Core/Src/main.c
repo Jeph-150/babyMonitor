@@ -28,6 +28,8 @@
 #define MPU6050_ADDR    (0x68 << 1)
 #define TEMP_LOW        36.0f
 #define TEMP_HIGH       37.5f
+#define AMB_TEMP_LOW    20.0f
+#define AMB_TEMP_HIGH   22.2f
 #define NO_MOTION_WARN  (40 * 60 * 1000)
 /* USER CODE END PD */
 
@@ -53,17 +55,21 @@ osThreadId_t tempTaskHandle;
 osThreadId_t hrTaskHandle;
 osThreadId_t motionTaskHandle;
 osThreadId_t uartTxTaskHandle;
+osThreadId_t spo2TaskHandle;
 
 const osThreadAttr_t tempTask_attr   = { .name = "TempTask",   .stack_size = 256*4, .priority = osPriorityNormal };
 const osThreadAttr_t hrTask_attr     = { .name = "HRTask",     .stack_size = 256*4, .priority = osPriorityNormal };
 const osThreadAttr_t motionTask_attr = { .name = "MotionTask", .stack_size = 256*4, .priority = osPriorityNormal };
 const osThreadAttr_t uartTxTask_attr = { .name = "UARTTxTask", .stack_size = 256*4, .priority = osPriorityNormal };
+const osThreadAttr_t spo2Task_attr   = { .name = "SpO2Task",   .stack_size = 256*4, .priority = osPriorityNormal };
 
-// Shared sensor data updated by each task
-volatile float    g_temp   = 0.0f;
-volatile uint32_t g_bpm    = 0;
-volatile float    g_motion = 0.0f;
-volatile uint8_t  g_finger = 0;
+// Shared sensor data
+volatile float    g_temp     = 0.0f;
+volatile float    g_amb_temp = 0.0f;
+volatile uint32_t g_bpm      = 0;
+volatile float    g_motion   = 0.0f;
+volatile uint8_t  g_finger   = 0;
+volatile float    g_spo2     = 0.0f;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -79,10 +85,13 @@ void Task_Temperature(void *argument);
 void Task_HeartRate(void *argument);
 void Task_Motion(void *argument);
 void Task_UART_TX(void *argument);
+void Task_SpO2(void *argument);
 void UART_Print(const char *msg);
 float MLX90614_ReadTemp(void);
+float MLX90614_ReadAmbientTemp(void);
 void MAX30102_Init(void);
 uint32_t MAX30102_ReadIR(void);
+uint32_t MAX30102_ReadRed(void);
 void MPU6050_Init(void);
 float MPU6050_GetMotionMagnitude(void);
 /* USER CODE END PFP */
@@ -93,10 +102,21 @@ void UART_Print(const char *msg) {
   HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
 }
 
+// Body object temperature (register 0x07)
 float MLX90614_ReadTemp(void) {
   uint8_t buf[3] = {0};
   HAL_StatusTypeDef status = HAL_I2C_Mem_Read(
     &hi2c1, MLX90614_ADDR, 0x07, I2C_MEMADD_SIZE_8BIT, buf, 3, 100);
+  if (status != HAL_OK) return -999.0f;
+  uint16_t raw = ((uint16_t)buf[1] << 8) | buf[0];
+  return raw * 0.02f - 273.15f;
+}
+
+// Ambient temperature (register 0x06)
+float MLX90614_ReadAmbientTemp(void) {
+  uint8_t buf[3] = {0};
+  HAL_StatusTypeDef status = HAL_I2C_Mem_Read(
+    &hi2c1, MLX90614_ADDR, 0x06, I2C_MEMADD_SIZE_8BIT, buf, 3, 100);
   if (status != HAL_OK) return -999.0f;
   uint16_t raw = ((uint16_t)buf[1] << 8) | buf[0];
   return raw * 0.02f - 273.15f;
@@ -126,6 +146,15 @@ uint32_t MAX30102_ReadIR(void) {
   return ir & 0x3FFFF;
 }
 
+
+uint32_t MAX30102_ReadRed(void) {
+  uint8_t buf[6] = {0};
+  HAL_I2C_Mem_Read(&hi2c1, MAX30102_ADDR, 0x07, I2C_MEMADD_SIZE_8BIT, buf, 6, 100);
+  uint32_t red = ((uint32_t)buf[0] << 16) | ((uint32_t)buf[1] << 8) | buf[2];
+  return red & 0x3FFFF;
+}
+
+
 void MPU6050_Init(void) {
   uint8_t buf[2] = {0x6B, 0x00};
   HAL_I2C_Master_Transmit(&hi2c1, MPU6050_ADDR, buf, 2, HAL_MAX_DELAY);
@@ -144,10 +173,6 @@ float MPU6050_GetMotionMagnitude(void) {
 }
 /* USER CODE END 0 */
 
-/**
-  * @brief  The application entry point.
-  * @retval int
-  */
 int main(void)
 {
   /* USER CODE BEGIN 1 */
@@ -195,6 +220,7 @@ int main(void)
   hrTaskHandle     = osThreadNew(Task_HeartRate,   NULL, &hrTask_attr);
   motionTaskHandle = osThreadNew(Task_Motion,      NULL, &motionTask_attr);
   uartTxTaskHandle = osThreadNew(Task_UART_TX,     NULL, &uartTxTask_attr);
+  spo2TaskHandle   = osThreadNew(Task_SpO2,        NULL, &spo2Task_attr);
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */
@@ -202,21 +228,196 @@ int main(void)
 
   osKernelStart();
 
-  /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
     /* USER CODE END WHILE */
-
     /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */
 }
 
-/**
-  * @brief System Clock Configuration
-  * @retval None
-  */
+/* USER CODE BEGIN 4 */
+
+// ── Temperature Task ──────────────────────────────────────
+void Task_Temperature(void *argument) {
+  char msg[64];
+  for (;;) {
+    float temp = MLX90614_ReadTemp();
+    float amb  = MLX90614_ReadAmbientTemp();
+
+    if (temp < -900.0f) {
+      UART_Print("[TEMP] I2C Error\r\n");
+    } else {
+      g_temp = temp;
+      snprintf(msg, sizeof(msg), "[TEMP] Body: %.2f C\r\n", temp);
+      UART_Print(msg);
+      if (temp < TEMP_LOW)
+        UART_Print("[ALERT] Body temp too low!\r\n");
+      else if (temp > TEMP_HIGH)
+        UART_Print("[ALERT] Body temp too high! Fan needed!\r\n");
+    }
+
+    if (amb > -900.0f) {
+      g_amb_temp = amb;
+      snprintf(msg, sizeof(msg), "[AMB] Ambient: %.2f C\r\n", amb);
+      UART_Print(msg);
+      if (amb < AMB_TEMP_LOW)
+        UART_Print("[ALERT] Ambient too cold! Turn on heater!\r\n");
+      else if (amb > AMB_TEMP_HIGH)
+        UART_Print("[ALERT] Ambient too hot! Turn on fan!\r\n");
+    }
+
+    osDelay(2000);
+  }
+}
+
+// ── Heart Rate Task ───────────────────────────────────────
+void Task_HeartRate(void *argument) {
+  char msg[64];
+  uint32_t prev_ir = 0;
+  uint8_t rising = 0;
+  uint32_t last_beat_time = 0;
+  uint32_t beat_intervals[4] = {0};
+  uint8_t beat_idx = 0;
+  uint8_t beat_count = 0;
+  float filtered = 0;
+  float alpha = 0.95f;
+  uint32_t lastPrint = 0;
+
+  for (;;) {
+    uint32_t ir = MAX30102_ReadIR();
+
+    if (ir < 5000 && filtered == 0) {
+
+    	// Add right after g_finger = 1;
+    		UART_Print("[HR] No finger\r\n");
+    		g_finger = 0;
+      g_bpm = 0;
+      filtered = 0;
+      prev_ir = 0;
+      rising = 0;
+      last_beat_time = 0;
+      beat_count = 0;
+      beat_idx = 0;
+      osDelay(100);
+      continue;
+    }
+
+    g_finger = 1;
+    filtered = alpha * (filtered + (float)ir - (float)prev_ir);
+    prev_ir = ir;
+
+    if (!rising && filtered > 200.0f) {
+      rising = 1;
+      uint32_t now = osKernelGetTickCount();
+      if (last_beat_time > 0) {
+        uint32_t interval = now - last_beat_time;
+        if (interval > 300 && interval < 2000) {
+          beat_intervals[beat_idx % 4] = interval;
+          beat_idx++;
+          beat_count++;
+          if (beat_count >= 4) {
+            uint32_t avg = (beat_intervals[0] + beat_intervals[1] +
+                           beat_intervals[2] + beat_intervals[3]) / 4;
+            g_bpm = 60000 / avg;
+          }
+        }
+      }
+      last_beat_time = now;
+    } else if (filtered < -200.0f) {
+      rising = 0;
+    }
+
+    uint32_t now2 = osKernelGetTickCount();
+    if (now2 - lastPrint >= 2000) {
+      if (g_finger && g_bpm > 0) {
+        snprintf(msg, sizeof(msg), "[HR] BPM: %lu\r\n", g_bpm);
+        UART_Print(msg);
+        if (g_bpm < 120 || g_bpm > 180)
+          UART_Print("[ALERT] Heart rate out of range!\r\n");
+      }
+      lastPrint = now2;
+    }
+
+    osDelay(10);
+  }
+}
+
+// ── SpO2 Task ─────────────────────────────────────────────
+void Task_SpO2(void *argument) {
+  char msg[64];
+  for (;;) {
+    if (g_finger) {
+      uint32_t red = MAX30102_ReadRed();
+      uint32_t ir  = MAX30102_ReadIR();
+      if (ir > 0) {
+        float ratio = (float)red / (float)ir;
+        float spo2 = 100.0f - 5.0f * ratio;
+        if (spo2 > 100.0f) spo2 = 100.0f;
+        if (spo2 <   0.0f) spo2 =   0.0f;
+        g_spo2 = spo2;
+        snprintf(msg, sizeof(msg), "[SPO2] %.1f%%\r\n", spo2);
+        UART_Print(msg);
+        if (spo2 < 95.0f)
+          UART_Print("[ALERT] Low oxygen saturation!\r\n");
+      }
+    }
+    osDelay(2000);
+  }
+}
+
+// ── Motion Task ───────────────────────────────────────────
+void Task_Motion(void *argument) {
+  char msg[64];
+  uint32_t lastMotionTime = osKernelGetTickCount();
+  for (;;) {
+    float mag = MPU6050_GetMotionMagnitude();
+    g_motion = mag;
+    snprintf(msg, sizeof(msg), "[MOTION] Mag: %.3f\r\n", mag);
+    UART_Print(msg);
+    if (mag > 1.05f)
+      lastMotionTime = osKernelGetTickCount();
+    uint32_t elapsed = osKernelGetTickCount() - lastMotionTime;
+    if (elapsed > NO_MOTION_WARN)
+      UART_Print("[ALERT] No movement for 40+ min!\r\n");
+    else if (elapsed > (20 * 60 * 1000))
+      UART_Print("[WARN] No movement for 20+ min!\r\n");
+    osDelay(500);
+  }
+}
+
+// ── UART TX Task (sends data to ESP32 via USART1) ─────────
+void Task_UART_TX(void *argument) {
+  char msg[128];
+  for (;;) {
+    snprintf(msg, sizeof(msg),
+      "TEMP:%.2f,BPM:%lu,MOT:%.3f,FNG:%d,AMB:%.2f,SPO2:%.1f\r\n",
+      g_temp, g_bpm, g_motion, g_finger, g_amb_temp, g_spo2);
+    HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+    osDelay(1000);
+  }
+}
+/* USER CODE END 4 */
+
+void StartDefaultTask(void *argument)
+{
+  /* USER CODE BEGIN 5 */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END 5 */
+}
+
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  __disable_irq();
+  while (1) {}
+  /* USER CODE END Error_Handler_Debug */
+}
+
 void SystemClock_Config(void)
 {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
@@ -248,15 +449,8 @@ void SystemClock_Config(void)
     Error_Handler();
 }
 
-/**
-  * @brief I2C1 Initialization Function
-  */
 static void MX_I2C1_Init(void)
 {
-  /* USER CODE BEGIN I2C1_Init 0 */
-  /* USER CODE END I2C1_Init 0 */
-  /* USER CODE BEGIN I2C1_Init 1 */
-  /* USER CODE END I2C1_Init 1 */
   hi2c1.Instance = I2C1;
   hi2c1.Init.ClockSpeed = 100000;
   hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
@@ -268,19 +462,10 @@ static void MX_I2C1_Init(void)
   hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
   if (HAL_I2C_Init(&hi2c1) != HAL_OK)
     Error_Handler();
-  /* USER CODE BEGIN I2C1_Init 2 */
-  /* USER CODE END I2C1_Init 2 */
 }
 
-/**
-  * @brief USART1 Initialization Function
-  */
 static void MX_USART1_UART_Init(void)
 {
-  /* USER CODE BEGIN USART1_Init 0 */
-  /* USER CODE END USART1_Init 0 */
-  /* USER CODE BEGIN USART1_Init 1 */
-  /* USER CODE END USART1_Init 1 */
   huart1.Instance = USART1;
   huart1.Init.BaudRate = 115200;
   huart1.Init.WordLength = UART_WORDLENGTH_8B;
@@ -291,19 +476,10 @@ static void MX_USART1_UART_Init(void)
   huart1.Init.OverSampling = UART_OVERSAMPLING_16;
   if (HAL_UART_Init(&huart1) != HAL_OK)
     Error_Handler();
-  /* USER CODE BEGIN USART1_Init 2 */
-  /* USER CODE END USART1_Init 2 */
 }
 
-/**
-  * @brief USART2 Initialization Function
-  */
 static void MX_USART2_UART_Init(void)
 {
-  /* USER CODE BEGIN USART2_Init 0 */
-  /* USER CODE END USART2_Init 0 */
-  /* USER CODE BEGIN USART2_Init 1 */
-  /* USER CODE END USART2_Init 1 */
   huart2.Instance = USART2;
   huart2.Init.BaudRate = 115200;
   huart2.Init.WordLength = UART_WORDLENGTH_8B;
@@ -314,18 +490,11 @@ static void MX_USART2_UART_Init(void)
   huart2.Init.OverSampling = UART_OVERSAMPLING_16;
   if (HAL_UART_Init(&huart2) != HAL_OK)
     Error_Handler();
-  /* USER CODE BEGIN USART2_Init 2 */
-  /* USER CODE END USART2_Init 2 */
 }
 
-/**
-  * @brief GPIO Initialization Function
-  */
 static void MX_GPIO_Init(void)
 {
   GPIO_InitTypeDef GPIO_InitStruct = {0};
-  /* USER CODE BEGIN MX_GPIO_Init_1 */
-  /* USER CODE END MX_GPIO_Init_1 */
 
   __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOH_CLK_ENABLE();
@@ -344,150 +513,6 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(LD2_GPIO_Port, &GPIO_InitStruct);
-
-  /* USER CODE BEGIN MX_GPIO_Init_2 */
-  /* USER CODE END MX_GPIO_Init_2 */
-}
-
-/* USER CODE BEGIN 4 */
-
-// ── Temperature Task ──────────────────────────────────────
-void Task_Temperature(void *argument) {
-  char msg[64];
-  for (;;) {
-    float temp = MLX90614_ReadTemp();
-    if (temp < -900.0f) {
-      UART_Print("[TEMP] I2C Error\r\n");
-    } else {
-      g_temp = temp;
-      snprintf(msg, sizeof(msg), "[TEMP] %.2f C\r\n", temp);
-      UART_Print(msg);
-      if (temp < TEMP_LOW || temp > TEMP_HIGH)
-        UART_Print("[ALERT] Temperature out of range!\r\n");
-    }
-    osDelay(2000);
-  }
-}
-
-// ── Heart Rate Task ───────────────────────────────────────
-void Task_HeartRate(void *argument) {
-  char msg[64];
-  uint32_t prev_ir = 0;
-  uint8_t rising = 0;
-  uint32_t last_beat_time = 0;
-  uint32_t beat_intervals[4] = {0};
-  uint8_t beat_idx = 0;
-  uint8_t beat_count = 0;
-  float filtered = 0;
-  float alpha = 0.95f;
-
-  for (;;) {
-    uint32_t ir = MAX30102_ReadIR();
-
-    if (ir < 10000) {
-      UART_Print("[HR] No finger\r\n");
-      g_finger = 0;
-      g_bpm = 0;
-      filtered = 0;
-      prev_ir = 0;
-      rising = 0;
-      last_beat_time = 0;
-      beat_count = 0;
-      beat_idx = 0;
-      osDelay(500);
-      continue;
-    }
-
-    g_finger = 1;
-    filtered = alpha * (filtered + (float)ir - (float)prev_ir);
-    prev_ir = ir;
-
-    if (!rising && filtered > 200.0f) {
-      rising = 1;
-      uint32_t now = osKernelGetTickCount();
-      if (last_beat_time > 0) {
-        uint32_t interval = now - last_beat_time;
-        if (interval > 300 && interval < 2000) {
-          beat_intervals[beat_idx % 4] = interval;
-          beat_idx++;
-          beat_count++;
-          if (beat_count >= 4) {
-            uint32_t avg = (beat_intervals[0] + beat_intervals[1] +
-                           beat_intervals[2] + beat_intervals[3]) / 4;
-            uint32_t bpm = 60000 / avg;
-            g_bpm = bpm;
-            snprintf(msg, sizeof(msg), "[HR] BPM: %lu\r\n", bpm);
-            UART_Print(msg);
-            if (bpm < 120 || bpm > 180)
-              UART_Print("[ALERT] Heart rate out of range!\r\n");
-          }
-        }
-      }
-      last_beat_time = now;
-    } else if (filtered < -200.0f) {
-      rising = 0;
-    }
-
-    osDelay(10);
-  }
-}
-
-// ── Motion Task ───────────────────────────────────────────
-void Task_Motion(void *argument) {
-  char msg[64];
-  uint32_t lastMotionTime = osKernelGetTickCount();
-  for (;;) {
-    float mag = MPU6050_GetMotionMagnitude();
-    g_motion = mag;
-    snprintf(msg, sizeof(msg), "[MOTION] Mag: %.3f\r\n", mag);
-    UART_Print(msg);
-    if (mag > 1.05f)
-      lastMotionTime = osKernelGetTickCount();
-    if ((osKernelGetTickCount() - lastMotionTime) > NO_MOTION_WARN)
-      UART_Print("[ALERT] No movement for 40+ min!\r\n");
-    osDelay(500);
-  }
-}
-
-// ── UART TX Task (sends data to ESP32 via USART1) ─────────
-void Task_UART_TX(void *argument) {
-  char msg[128];
-  for (;;) {
-    snprintf(msg, sizeof(msg), "TEMP:%.2f,BPM:%lu,MOT:%.3f,FNG:%d\r\n",
-             g_temp, g_bpm, g_motion, g_finger);
-    HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
-    osDelay(1000);
-  }
-}
-/* USER CODE END 4 */
-
-/* USER CODE BEGIN Header_StartDefaultTask */
-/**
-  * @brief  Function implementing the defaultTask thread.
-  * @param  argument: Not used
-  * @retval None
-  */
-/* USER CODE END Header_StartDefaultTask */
-void StartDefaultTask(void *argument)
-{
-  /* USER CODE BEGIN 5 */
-  for(;;)
-  {
-    osDelay(1);
-  }
-  /* USER CODE END 5 */
-}
-
-/**
-  * @brief  This function is executed in case of error occurrence.
-  * @retval None
-  */
-void Error_Handler(void)
-{
-  /* USER CODE BEGIN Error_Handler_Debug */
-  __disable_irq();
-  while (1) {}
-  /* USER CODE END Error_Handler_Debug */
 }
 
 #ifdef USE_FULL_ASSERT
