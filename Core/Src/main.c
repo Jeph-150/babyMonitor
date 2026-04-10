@@ -53,7 +53,7 @@ osThreadId_t mlxTaskHandle;
 const osThreadAttr_t maxTask_attr    = { .name = "MAXTask",    .stack_size = 512*4, .priority = osPriorityNormal };
 const osThreadAttr_t motionTask_attr = { .name = "MotionTask", .stack_size = 256*4, .priority = osPriorityNormal };
 const osThreadAttr_t uartTxTask_attr = { .name = "UARTTxTask", .stack_size = 256*4, .priority = osPriorityNormal };
-const osThreadAttr_t soundTask_attr  = { .name = "SoundTask",  .stack_size = 256*4, .priority = osPriorityNormal };
+const osThreadAttr_t soundTask_attr  = { .name = "SoundTask",  .stack_size = 512*4, .priority = osPriorityNormal };
 const osThreadAttr_t mlxTask_attr    = { .name = "MLXTask",    .stack_size = 256*4, .priority = osPriorityNormal };
 
 volatile float    g_temp     = 0.0f;
@@ -250,6 +250,8 @@ void Task_MAX30102(void *argument) {
     if (ir < 50000) {
       g_finger = 0;
       g_bpm    = 0;
+      g_spo2   = 0.0f;
+      g_max_temp = 0.00f;
       filtered = 0;
       prev_ir  = 0;
       rising   = 0;
@@ -321,7 +323,7 @@ void Task_MAX30102(void *argument) {
       osDelay(15);
       float temp = MAX30102_ReadTemp();
       g_max_temp = temp;
-      snprintf(msg, sizeof(msg), "[MAX_TEMP] %.2f C\r\n", temp);
+      snprintf(msg, sizeof(msg), "[BODY_TEMP] %.2f C\r\n", temp);
       UART_Print(msg);
       lastTEMP = now;
     }
@@ -341,15 +343,15 @@ void Task_MLX90614(void *argument) {
 
     if (body > -900.0f) {
       g_temp = body;
-      snprintf(msg, sizeof(msg), "[TEMP] Body: %.2f C\r\n", body);
+      snprintf(msg, sizeof(msg), "[RTEMP] : %.2f C\r\n", body);
       UART_Print(msg);
     }
 
-    if (amb > -900.0f) {
-      g_amb_temp = amb;
-      snprintf(msg, sizeof(msg), "[AMB] %.2f C\r\n", amb);
-      UART_Print(msg);
-    }
+//    if (amb > -900.0f) {
+//      g_amb_temp = amb;
+//      snprintf(msg, sizeof(msg), "[AMB] %.2f C\r\n", amb);
+//      UART_Print(msg);
+//    }
 
     osDelay(4000);  // 4s — temp is slow moving
   }
@@ -364,7 +366,7 @@ void Task_Motion(void *argument) {
   for (;;) {
     float mag = MPU6050_GetMotionMagnitude();
     g_motion  = mag;
-    snprintf(msg, sizeof(msg), "[MOT] %.3f\r\n", mag);
+    snprintf(msg, sizeof(msg), "[MOT] %.3f\r\n", mag*9.81f);
     UART_Print(msg);
 
     if (mag > 1.05f)
@@ -381,71 +383,154 @@ void Task_Motion(void *argument) {
 }
 
 // ── Sound Task — HW484 ────────────────────────────────────
+//void Task_Sound(void *argument) {
+//  char msg[64];
+//
+//  uint32_t baseline = HW484_ReadSound();
+//
+//  typedef enum { SOUND_QUIET, SOUND_DETECTING, SOUND_ALERT } SoundState_t;
+//  SoundState_t state = SOUND_QUIET;
+//
+//  uint32_t loud_onset  = 0;
+//  uint32_t quiet_onset = 0;
+//  uint32_t last_alert  = 0;
+//  uint32_t last_ok     = 0;
+//
+//  osDelay(500);
+//
+//  for (;;) {
+//    uint32_t adc_val = HW484_ReadSound();
+//    g_sound = adc_val;
+//
+//    uint8_t  is_loud = (adc_val > baseline + 400) || (adc_val < baseline - 400);
+//    uint32_t now     = osKernelGetTickCount();
+//
+//    switch (state) {
+//      case SOUND_QUIET:
+//        if (is_loud) {
+//          loud_onset = now;
+//          state = SOUND_DETECTING;
+//        } else if ((now - last_ok) >= 10000) {
+//          snprintf(msg, sizeof(msg), "[SOUND] OK, ADC:%lu\r\n", adc_val);
+//          UART_Print(msg);
+//          last_ok = now;
+//        }
+//        break;
+//
+//      case SOUND_DETECTING:
+//        if (!is_loud) {
+//          state = SOUND_QUIET;
+//        } else if ((now - loud_onset) >= SOUND_LOUD_MS) {
+//          state = SOUND_ALERT;
+//          snprintf(msg, sizeof(msg), "[ALERT] Crying! ADC:%lu\r\n", adc_val);
+//          UART_Print(msg);
+//          last_alert = now;
+//        }
+//        break;
+//
+//      case SOUND_ALERT:
+//        if (!is_loud) {
+//          if (quiet_onset == 0) quiet_onset = now;
+//          else if ((now - quiet_onset) >= SOUND_QUIET_MS) {
+//            state       = SOUND_QUIET;
+//            quiet_onset = 0;
+//            UART_Print("[SOUND] Quiet again\r\n");
+//            last_ok = now;
+//          }
+//        } else {
+//          quiet_onset = 0;
+//          if ((now - last_alert) >= 5000) {
+//            snprintf(msg, sizeof(msg), "[ALERT] Still crying! ADC:%lu\r\n", adc_val);
+//            UART_Print(msg);
+//            last_alert = now;
+//          }
+//        }
+//        break;
+//    }
+//
+//    osDelay(50);
+//  }
+//}
+#define SOUND_DEVIATION 300
+
 void Task_Sound(void *argument) {
-  char msg[64];
+    char msg[64];
+    uint32_t baseline = 2048;  // safe default — tune after first boot
+    uint32_t loud_onset  = 0;
+    uint32_t quiet_onset = 0;
+    uint32_t last_alert  = 0;
+    uint32_t last_ok     = 0;
 
-  typedef enum { SOUND_QUIET, SOUND_DETECTING, SOUND_ALERT } SoundState_t;
-  SoundState_t state = SOUND_QUIET;
+    typedef enum { SOUND_QUIET, SOUND_DETECTING, SOUND_ALERT } SoundState_t;
+    SoundState_t state = SOUND_QUIET;
 
-  uint32_t loud_onset  = 0;
-  uint32_t quiet_onset = 0;
-  uint32_t last_alert  = 0;
-  uint32_t last_ok     = 0;
-
-  osDelay(500);
-
-  for (;;) {
-    uint32_t adc_val = HW484_ReadSound();
-    g_sound = adc_val;
-
-    uint8_t  is_loud = (adc_val >= SOUND_THRESHOLD);
-    uint32_t now     = osKernelGetTickCount();
-
-    switch (state) {
-      case SOUND_QUIET:
-        if (is_loud) {
-          loud_onset = now;
-          state = SOUND_DETECTING;
-        } else if ((now - last_ok) >= 10000) {
-          snprintf(msg, sizeof(msg), "[SOUND] OK, ADC:%lu\r\n", adc_val);
-          UART_Print(msg);
-          last_ok = now;
-        }
-        break;
-
-      case SOUND_DETECTING:
-        if (!is_loud) {
-          state = SOUND_QUIET;
-        } else if ((now - loud_onset) >= SOUND_LOUD_MS) {
-          state = SOUND_ALERT;
-          snprintf(msg, sizeof(msg), "[ALERT] Crying! ADC:%lu\r\n", adc_val);
-          UART_Print(msg);
-          last_alert = now;
-        }
-        break;
-
-      case SOUND_ALERT:
-        if (!is_loud) {
-          if (quiet_onset == 0) quiet_onset = now;
-          else if ((now - quiet_onset) >= SOUND_QUIET_MS) {
-            state       = SOUND_QUIET;
-            quiet_onset = 0;
-            UART_Print("[SOUND] Quiet again\r\n");
-            last_ok = now;
-          }
-        } else {
-          quiet_onset = 0;
-          if ((now - last_alert) >= 5000) {
-            snprintf(msg, sizeof(msg), "[ALERT] Still crying! ADC:%lu\r\n", adc_val);
-            UART_Print(msg);
-            last_alert = now;
-          }
-        }
-        break;
+    // Calibrate baseline
+    osDelay(500);
+    uint32_t sum = 0;
+    for (int i = 0; i < 16; i++) {
+        sum += HW484_ReadSound();
+        osDelay(20);
     }
+    baseline = sum / 16;
 
-    osDelay(50);
-  }
+    snprintf(msg, sizeof(msg), "[SOUND] Baseline: %lu\r\n", baseline);
+    UART_Print(msg);
+
+    for (;;) {
+        uint32_t adc_val = HW484_ReadSound();
+        g_sound = adc_val;
+
+        int32_t deviation = (int32_t)adc_val - (int32_t)baseline;
+        if (deviation < 0) deviation = -deviation;
+        uint8_t  is_loud = (deviation >= SOUND_DEVIATION);
+        uint32_t now     = osKernelGetTickCount();
+
+        switch (state) {
+            case SOUND_QUIET:
+                if (is_loud) {
+                    loud_onset = now;
+                    state = SOUND_DETECTING;
+                } else if ((now - last_ok) >= 10000) {
+                    snprintf(msg, sizeof(msg), "[SOUND] OK, ADC:%lu\r\n", adc_val);
+                    UART_Print(msg);
+                    last_ok = now;
+                }
+                break;
+
+            case SOUND_DETECTING:
+                if (!is_loud) {
+                    state = SOUND_QUIET;
+                } else if ((now - loud_onset) >= SOUND_LOUD_MS) {
+                    state = SOUND_ALERT;
+                    snprintf(msg, sizeof(msg), "[ALERT] Crying! ADC:%lu\r\n", adc_val);
+                    UART_Print(msg);
+                    last_alert = now;
+                    quiet_onset = 0;
+                }
+                break;
+
+            case SOUND_ALERT:
+                if (!is_loud) {
+                    if (quiet_onset == 0) quiet_onset = now;
+                    else if ((now - quiet_onset) >= SOUND_QUIET_MS) {
+                        state = SOUND_QUIET;
+                        quiet_onset = 0;
+                        UART_Print("[SOUND] Quiet again\r\n");
+                        last_ok = now;
+                    }
+                } else {
+                    quiet_onset = 0;
+                    if ((now - last_alert) >= 5000) {
+                        snprintf(msg, sizeof(msg), "[ALERT] Still crying! ADC:%lu\r\n", adc_val);
+                        UART_Print(msg);
+                        last_alert = now;
+                    }
+                }
+                break;
+        }
+
+        osDelay(50);
+    }
 }
 
 // ── UART TX Task — sends to ESP32 via USART1 ─────────────
@@ -453,8 +538,8 @@ void Task_UART_TX(void *argument) {
   char msg[128];
   for (;;) {
     snprintf(msg, sizeof(msg),
-      "TEMP:%.2f,BPM:%lu,MOT:%.3f,FNG:%d,AMB:%.2f,SPO2:%.1f,SND:%lu\r\n",
-      g_temp, g_bpm, g_motion, g_finger, g_amb_temp, g_spo2, g_sound);
+      "TEMP:%.2f,BPM:%lu,MOT:%.3f,FNG:%d,BODY_TEMP:%.2f,SPO2:%.1f,SND:%lu\r\n",
+      g_temp, g_bpm, g_motion, g_finger, g_max_temp, g_spo2, g_sound);
     HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
     osDelay(1000);
   }
@@ -578,6 +663,12 @@ static void MX_GPIO_Init(void) {
   GPIO_InitStruct.Pull  = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(LD2_GPIO_Port, &GPIO_InitStruct);
+
+  // Add inside MX_GPIO_Init, after enabling GPIOA clock
+  GPIO_InitStruct.Pin  = GPIO_PIN_1;          // PA1 = ADC1_IN1
+  GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 }
 
 #ifdef USE_FULL_ASSERT
